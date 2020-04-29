@@ -22,6 +22,11 @@ export interface PortMapping {
     readonly targetPort: number;
 }
 
+interface ExtractedPort {
+    readonly name: string;
+    readonly port: number;
+}
+
 interface ValidationResult {
     readonly valid: boolean;
     readonly error?: string;
@@ -101,7 +106,7 @@ export async function portForwardKubernetes(kubectl: Kubectl, explorerNode?: any
  * if a valid input was provided.
  */
 async function promptAndForwardPort(kubectl: Kubectl, kind: string, resourceName: string, namespace?: string): Promise<void> {
-    const portMapping = await promptForPort(kubectl, resourceName, namespace);
+    const portMapping = await promptForPort(kubectl, kind, resourceName, namespace);
     if (portMapping.length !== 0) {
         portForwardToResource(kubectl, kind, resourceName, portMapping, namespace);
     }
@@ -111,42 +116,74 @@ async function promptAndForwardPort(kubectl: Kubectl, kind: string, resourceName
  * Given a JSON representation of a Pod, extract the ports to suggest to the user for
  * for port forwarding.
  */
-function extractPodPorts(podJson: string): string | undefined {
+function extractPodPorts(podJson: string): ExtractedPort[] {
     const pod = JSON.parse(podJson) as kubernetes.V1Pod;
+    const ports = Array.of<ExtractedPort>();
     const containers = pod.spec.containers;
-    const ports = Array.of<number>();
     containers.forEach((container) => {
         if (container.ports) {
-            const containerPorts = container.ports.map((port) => port.containerPort);
+            const containerPorts = container.ports.map(({name, containerPort}) => ({name, port: containerPort}));
             ports.push(...containerPorts);
         }
     });
-    if (ports.length > 0) {
-        const portPairs = ports.map((port) => `${port}:${port}`);
-        return portPairs.join(' ');
-    }
-    return;
+    return ports;
+}
+
+/**
+ * Given a JSON representation of a Service, extract the ports to suggest to the user
+ * for port forwarding.
+ */
+function extractServicePorts(podJson: string): ExtractedPort[] {
+    const service = JSON.parse(podJson) as kubernetes.V1Service;
+    return service.spec.ports;
+}
+
+/**
+ * Given a JSON representation of a Deployment, extract the ports to suggest to the user
+ * for port forwarding.
+ */
+function extractDeploymentPorts(podJson: string): ExtractedPort[] {
+    const deployment = JSON.parse(podJson) as kubernetes.V1Deployment;
+    const ports = Array.of<ExtractedPort>();
+    const containers = deployment.spec.template.spec.containers;
+    containers.forEach((container) => {
+        if (container.ports) {
+            const containerPorts = container.ports.map(({name, containerPort}) => ({name, port: containerPort}));
+            ports.push(...containerPorts);
+        }
+    });
+    return ports;
 }
 
 /**
  * Prompts the user on what port to port-forward to, and validates numeric input.
  * @returns An array of PortMapping objects.
  */
-async function promptForPort(kubectl?: Kubectl, podName?: string, namespace?: string): Promise<PortMapping[]> {
+async function promptForPort(kubectl: Kubectl, kind: string, resourceName: string, namespace?: string): Promise<PortMapping[]> {
     let portString: string | undefined;
-    let defaultValue: string | undefined = undefined;
-    if (podName && kubectl) {
+    let extractedPorts: ExtractedPort[] = [];
+    if (resourceName && kubectl) {
         const ns = namespace || 'default';
         try {
-            const result = await kubectl.invokeCommand(`get pods ${podName} --namespace ${ns} -o json`);
+            const result = await kubectl.invokeCommand(`get ${kind} ${resourceName} --namespace ${ns} -o json`);
             if (ExecResult.failed(result)) {
                 console.log(ExecResult.failureMessage(result, { whatFailed: 'Error getting ports' }));
-            } else {
-                defaultValue = extractPodPorts(result.stdout);
+            } else if (kind === kuberesources.allKinds.pod.apiName) {
+                extractedPorts = extractPodPorts(result.stdout);
+            } else if (kind === kuberesources.allKinds.service.apiName) {
+                extractedPorts = extractServicePorts(result.stdout);
+            } else if (kind === kuberesources.allKinds.deployment.apiName) {
+                extractedPorts = extractDeploymentPorts(result.stdout);
             }
         } catch (err) {
             console.log(err);
         }
+    }
+
+    let defaultValue: string | undefined = undefined;
+    if (extractedPorts.length > 0) {
+        const portPairs = extractedPorts.map(({port}) => `${port}:${port}`);
+        defaultValue = portPairs.join(' ');
     }
 
     try {
